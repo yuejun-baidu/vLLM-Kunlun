@@ -16,7 +16,6 @@
 #
 import copy
 from dataclasses import dataclass
-from itertools import accumulate
 from typing import (
     TYPE_CHECKING,
     Any,
