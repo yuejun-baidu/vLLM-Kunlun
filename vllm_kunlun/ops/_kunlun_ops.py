@@ -475,25 +475,25 @@ class KunlunOps:
             #     attn_metadata = attn_metadata[prefix]
 
             # if attn_metadata is None or attn_metadata.num_prefills > 0 or :
-            if M * moe_top_k < 400:
-                sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
-                    torch.ops.xspeedgate_ops.moe_pre_small(
-                        topk_ids, global_num_experts, False, False, hidden_states
-                    )
-                )
-                experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(
-                    topk_ids, global_num_experts, False
-                )
-                out = torch.ops.xspeedgate_ops.fused_moe(
-                    hidden_states,
-                    w1,
-                    w2,
-                    normed_score.to(hidden_states.dtype),
-                    sorted_tokens_num_lod,
-                    sorted_tokens_idx,
-                    experts_num_lod,
-                )
-                return out.sum(1)
+            # if M * moe_top_k < 400:
+            #     sorted_tokens_idx, sorted_tokens_num_lod, moe_expand = (
+            #         torch.ops.xspeedgate_ops.moe_pre_small(
+            #             topk_ids, global_num_experts, False, False, hidden_states
+            #         )
+            #     )
+            #     experts_num_lod = torch.ops.xspeedgate_ops.moe_active_expert_balance(
+            #         topk_ids, global_num_experts, False
+            #     )
+            #     out = torch.ops.xspeedgate_ops.fused_moe(
+            #         hidden_states,
+            #         w1,
+            #         w2,
+            #         normed_score.to(hidden_states.dtype),
+            #         sorted_tokens_num_lod,
+            #         sorted_tokens_idx,
+            #         experts_num_lod,
+            #     )
+            #     return out.sum(1)
 
             # Allocate two shared workspaces for the large temporary buffers
             # used by the preprocess, W1, activation, and W2 stages.
@@ -502,26 +502,21 @@ class KunlunOps:
             out1_numel = M * moe_top_k * (w1.shape[1] // 2)
             moe_expand_numel = M * moe_top_k * N
 
-            # Live ranges:
-            #   M * moe_top_k <= 768, M >= 1024:
-            #     workspace_a: out
-            #     workspace_b: y
-            #   M * moe_top_k <= 768, M < 1024:
-            #     workspace_a: out1
-            #     workspace_b: y -> out
-            #   M * moe_top_k > 768, M >= 1024:
-            #     workspace_a: moe_expand -> out
-            #     workspace_b: y
-            #   M * moe_top_k > 768, M < 1024:
-            #     workspace_a: moe_expand -> out1
-            #     workspace_b: y -> out
-            workspace_a_numel = out_numel
-            workspace_b_numel = y_numel
-
-            if M < 1024:
-                workspace_a_numel = out1_numel
-                workspace_b_numel = max(y_numel, out_numel)
-
+            # NOTE(2026-XX): the fused `moe_fc(act="SWISH_GLU")` kernel
+            # produces incorrect output across all M >= 1024 (verified by
+            # standalone repro: kernel rel-err ~2000% vs fp32 reference,
+            # while `moe_fc(act=None) + silu_and_mul` matches reference at
+            # bf16 precision floor). This was the source of the multi-
+            # concurrent "garbled output" symptom: concurrent requests
+            # batch up to M >= 1024 and hit the broken fused path. Until
+            # the kernel team fixes SWISH_GLU, always use the act=None +
+            # explicit silu_and_mul path. Repro: .comate/test_fused_moe_compare.py
+            #
+            # Live ranges (act=None path, all M):
+            #   workspace_a: (moe_expand if M*top_k > 768) -> out1
+            #   workspace_b: y -> out
+            workspace_a_numel = max(out1_numel, out_numel)
+            workspace_b_numel = max(y_numel, out_numel)
             if M * moe_top_k > 768:
                 workspace_a_numel = max(workspace_a_numel, moe_expand_numel)
 
@@ -574,39 +569,24 @@ class KunlunOps:
             moe_expand = moe_expand.reshape(M * moe_top_k, hidden_dim)
             y = workspace_b[:y_numel].view(M, moe_top_k, w1.shape[1])
 
-            if M < 1024:
-                torch.ops._C.moe_fc(
-                    x=moe_expand,
-                    weight=w1,
-                    sorted_tokens_num_lod=sorted_tokens_num_lod,
-                    sorted_tokens_idx=sorted_tokens_idx,
-                    moe_topk=moe_top_k,
-                    y=y,
-                )
-                # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
-                # needed.
-                out1 = workspace_a[:out1_numel].view(M, moe_top_k, w1.shape[1] // 2)
-                torch.ops._C.silu_and_mul(out1, y)
-                out1 = out1.reshape(-1, out1.shape[-1])
-                # Reuse `workspace_b` for `out` after `y` has been consumed by
-                # the activation.
-                out = workspace_b[:out_numel].view(M, moe_top_k, w2.shape[1])
-            else:
-                torch.ops._C.moe_fc(
-                    x=moe_expand,
-                    weight=w1,
-                    sorted_tokens_num_lod=sorted_tokens_num_lod,
-                    sorted_tokens_idx=sorted_tokens_idx,
-                    moe_topk=moe_top_k,
-                    y=y,
-                    act="SWISH_GLU",
-                )
-
-                y = y[..., : y.shape[-1] // 2]
-                out1 = y.reshape(-1, y.shape[-1])
-                # Reuse `workspace_a` for `out` after `moe_expand` is no longer
-                # needed.
-                out = workspace_a[:out_numel].view(M, moe_top_k, w2.shape[1])
+            # W1 GEMM (no fused activation; the fused SWISH_GLU kernel is
+            # buggy at large M -- see note above).
+            torch.ops._C.moe_fc(
+                x=moe_expand,
+                weight=w1,
+                sorted_tokens_num_lod=sorted_tokens_num_lod,
+                sorted_tokens_idx=sorted_tokens_idx,
+                moe_topk=moe_top_k,
+                y=y,
+            )
+            # Reuse `workspace_a` for `out1` after `moe_expand` is no longer
+            # needed.
+            out1 = workspace_a[:out1_numel].view(M, moe_top_k, w1.shape[1] // 2)
+            torch.ops._C.silu_and_mul(out1, y)
+            out1 = out1.reshape(-1, out1.shape[-1])
+            # Reuse `workspace_b` for `out` after `y` has been consumed by
+            # the activation.
+            out = workspace_b[:out_numel].view(M, moe_top_k, w2.shape[1])
 
             dequant_scale = torch.ones(
                 (M, moe_top_k), dtype=torch.float32, device=hidden_states.device
