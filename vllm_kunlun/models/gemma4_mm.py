@@ -897,8 +897,11 @@ class Gemma4MultimodalEmbedder(nn.Module):
             # Manual fp32 matmul to avoid modifying module state (not thread-safe
             # for TP). Cast inputs and weights to fp32, compute in fp32, cast back.
             weight = self.embedding_projection.weight.to(torch.float32)
-            bias = (self.embedding_projection.bias.to(torch.float32)
-                    if self.embedding_projection.bias is not None else None)
+            bias = (
+                self.embedding_projection.bias.to(torch.float32)
+                if self.embedding_projection.bias is not None
+                else None
+            )
             inputs_fp32 = embs_normed.to(torch.float32)
             embs_proj = torch.nn.functional.linear(inputs_fp32, weight, bias)
             embs_proj = embs_proj.to(orig_dtype)
@@ -1432,8 +1435,9 @@ class Gemma4ForConditionalGeneration(
                 if name.endswith(std_buffer_suffixes):
                     # Only the vision_tower top-level buffers need loading;
                     # ignore any other std_bias/std_scale that may exist.
-                    if name.endswith(("vision_tower.std_bias",
-                                      "vision_tower.std_scale")):
+                    if name.endswith(
+                        ("vision_tower.std_bias", "vision_tower.std_scale")
+                    ):
                         # Load the trained standardize buffers into the vision
                         # tower. self.vision_tower is an HF Gemma4VisionModel
                         # whose forward applies (hidden - std_bias) * std_scale.
